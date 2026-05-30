@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+api = {path = "../api"}
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
+async-channel = "2.5.0"
+home = "0.5.12"
+glib = "0.22.7"
+gtk4 = "0.11.3"
+libadwaita = { version="0.9.1", features = ["v1_4"] }
