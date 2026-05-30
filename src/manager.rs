@@ -3,11 +3,13 @@ use crate::client::TrueNasClient;
 use crate::result::ApiResult;
 use crate::services::auth::AuthService;
 use crate::services::system::SystemService;
+use crate::services::sharing::SharingService;
 
 pub struct TrueNasApiManager {
-    pub(crate) client: Arc<TrueNasClient>,
+    pub client: Arc<TrueNasClient>,
     pub auth: AuthService,
     pub system: SystemService,
+    pub sharing : SharingService
 }
 
 impl TrueNasApiManager {
@@ -15,7 +17,8 @@ impl TrueNasApiManager {
         let client = Arc::new(TrueNasClient::new(server_url, insecure));
         let auth = AuthService::new(Arc::clone(&client));
         let system = SystemService::new(Arc::clone(&client));
-        Self { client, auth,system }
+        let sharing = SharingService::new(Arc::clone(&client));
+        Self { client, auth,system,sharing }
     }
 
     pub async fn connect(&self) -> bool {
@@ -62,5 +65,14 @@ impl TrueNasApiManager {
             return self.client.call::<T>(method, params).await;
         }
         ApiResult::Error { message: "Session expired. Please login again.".to_string() }
+    }
+    pub fn start_keep_alive(&self) {
+        let client = Arc::clone(&self.client);
+        glib::MainContext::default().spawn_local(async move {
+            loop {
+                glib::timeout_future_seconds(60).await;
+                let _ = client.call::<String>("core.ping", vec![]).await;
+            }
+        });
     }
 }

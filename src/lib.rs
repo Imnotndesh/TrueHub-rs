@@ -1,11 +1,11 @@
-mod client;
-mod manager;
+pub mod client;
+pub mod manager;
 pub mod result;
 pub mod methods;
 pub mod services;
 pub mod models;
 mod logger;
-mod store;
+pub mod store;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

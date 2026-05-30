@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::fs;
+use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPrefs {
@@ -26,19 +26,19 @@ fn prefs_path() -> PathBuf {
         .join("prefs.json")
 }
 
-pub async fn load() -> AppPrefs {
+pub fn load_sync() -> AppPrefs {
     let path = prefs_path();
-    match fs::read_to_string(&path).await {
+    match fs::read_to_string(&path) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
         Err(_) => AppPrefs::default(),
     }
 }
 
-pub async fn save(prefs: &AppPrefs) -> Result<(), String> {
+pub fn save_sync(prefs: &AppPrefs) -> Result<(), String> {
     let path = prefs_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(prefs).map_err(|e| e.to_string())?;
-    fs::write(&path, json).await.map_err(|e| e.to_string())
+    fs::write(&path, json).map_err(|e| e.to_string())
 }

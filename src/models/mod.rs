@@ -1,8 +1,8 @@
 pub mod auth;
 pub mod connection;
-pub(crate) mod system;
+pub mod system;
 mod config;
-pub(crate) mod shares;
+pub mod shares;
 pub(crate) mod user;
 mod apps;
 pub(crate) mod virt;

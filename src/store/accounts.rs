@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::fs;
+use std::fs;
 use keyring::Entry;
 use uuid::Uuid;
 
@@ -133,7 +133,7 @@ pub fn clear_account_credentials(account_id: &str) {
 }
 
 async fn load_store() -> AccountStore {
-    match fs::read_to_string(store_path()).await {
+    match fs::read_to_string(store_path()) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => AccountStore::default(),
     }
@@ -142,10 +142,10 @@ async fn load_store() -> AccountStore {
 async fn save_store(store: &AccountStore) -> Result<(), String> {
     let path = store_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    fs::write(path, json).await.map_err(|e| e.to_string())
+    fs::write(path, json).map_err(|e| e.to_string())
 }
 
 pub async fn save_server(server: SavedServer) -> Result<(), String> {
@@ -256,5 +256,5 @@ pub async fn clear_all() -> Result<(), String> {
         clear_account_credentials(&account.id);
     }
     clear_account_credentials("session");
-    fs::remove_file(store_path()).await.map_err(|e| e.to_string())
+    fs::remove_file(store_path()).map_err(|e| e.to_string())
 }
