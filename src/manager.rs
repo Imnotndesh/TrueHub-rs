@@ -2,17 +2,20 @@ use std::sync::Arc;
 use crate::client::TrueNasClient;
 use crate::result::ApiResult;
 use crate::services::auth::AuthService;
+use crate::services::system::SystemService;
 
 pub struct TrueNasApiManager {
     pub(crate) client: Arc<TrueNasClient>,
     pub auth: AuthService,
+    pub system: SystemService,
 }
 
 impl TrueNasApiManager {
     pub fn new(server_url: impl Into<String>, insecure: bool) -> Self {
         let client = Arc::new(TrueNasClient::new(server_url, insecure));
         let auth = AuthService::new(Arc::clone(&client));
-        Self { client, auth }
+        let system = SystemService::new(Arc::clone(&client));
+        Self { client, auth,system }
     }
 
     pub async fn connect(&self) -> bool {

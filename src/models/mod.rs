@@ -1,2 +1,10 @@
 pub mod auth;
 pub mod connection;
+pub(crate) mod system;
+mod config;
+pub(crate) mod shares;
+pub(crate) mod user;
+mod apps;
+pub(crate) mod virt;
+pub(crate) mod vm;
+pub(crate) mod storage;
