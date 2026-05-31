@@ -1,3 +1,4 @@
+
 use gtk4::prelude::*;
 use gtk4::{
     Stack, Orientation, Align, ScrolledWindow,
@@ -7,18 +8,21 @@ use libadwaita::prelude::*;
 use libadwaita::{
     ApplicationWindow, HeaderBar, ToolbarView,
     ActionRow, ExpanderRow, PreferencesGroup,
-    Banner, StatusPage, BreakpointCondition, Breakpoint,
-    BreakpointConditionLengthType,
+    Banner, StatusPage,
 };
 use glib::clone;
 use std::sync::{Arc, Mutex};
+use gtk4::accessible::State;
 use crate::state::AppState;
 use crate::runtime;
-use api::manager::TrueNasApiManager;
+use api::client::TrueNasClient;
 use api::models::system::{SystemInfo, Pool, DiskDetails};
 use api::models::shares::{SmbShare, NfsShare};
 use api::result::ApiResult;
 use api::methods::{System as SystemMethods, Shares as ShareMethods};
+use crate::pages::{disk_info, performance, pool_details, share_info};
+use crate::pages::performance::MetricType;
+use crate::pages::share_info::ShareType;
 
 #[derive(Clone)]
 pub struct HomeData {
@@ -81,31 +85,37 @@ pub fn build(
         .margin_end(12)
         .build();
 
-    let loading = GBox::builder()
+    let loading_box = GBox::builder()
         .orientation(Orientation::Vertical)
         .valign(Align::Center)
         .halign(Align::Center)
-        .spacing(12)
+        .spacing(16)
         .vexpand(true)
         .build();
-    let load_spinner = gtk4::Spinner::new();
-    load_spinner.start();
+
+    let spinner = gtk4::Spinner::new();
+    spinner.start();
+    spinner.set_size_request(32, 32);
+
     let load_label = gtk4::Label::builder()
-        .label("Loading dashboard...")
+        .label("Loading dashboard…")
         .css_classes(vec!["dim-label"])
         .build();
-    loading.append(&load_spinner);
-    loading.append(&load_label);
 
-    let page_stack = Stack::new();
-    page_stack.set_transition_duration(200);
-    page_stack.add_named(&loading, Some("loading"));
-    page_stack.add_named(&content_box, Some("content"));
+    loading_box.append(&spinner);
+    loading_box.append(&load_label);
 
     let error_page = StatusPage::builder()
         .icon_name("network-error-symbolic")
-        .title("Failed to load")
+        .title("Connection Failed")
+        .description("Could not reach the TrueNAS server.")
         .build();
+
+    let page_stack = Stack::new();
+    page_stack.set_transition_type(StackTransitionType::Crossfade);
+    page_stack.set_transition_duration(250);
+    page_stack.add_named(&loading_box, Some("loading"));
+    page_stack.add_named(&content_box, Some("content"));
     page_stack.add_named(&error_page, Some("error"));
     page_stack.set_visible_child_name("loading");
 
@@ -113,8 +123,6 @@ pub fn build(
     toolbar_view.set_content(Some(&scroll));
 
     let data_store: Arc<Mutex<Option<HomeData>>> = Arc::new(Mutex::new(None));
-
-    let nav_stack = _root_stack.clone();
 
     let load = {
         let state = state.clone();
@@ -124,7 +132,7 @@ pub fn build(
         let error_page = error_page.clone();
         let data_store = data_store.clone();
         let title_label = title_label.clone();
-        let nav_stack = nav_stack.clone();
+        let nav_stack = _root_stack.clone();
         let window = window.clone();
 
         move || {
@@ -142,17 +150,16 @@ pub fn build(
                 #[strong] title_label,
                 #[strong] nav_stack,
                 #[strong] window,
+                #[strong] state,
                 async move {
                     if let Ok(result) = rx.recv().await {
                         match result {
                             HomeLoad::Success(data) => {
                                 title_label.set_label(&data.system_info.hostname);
-
                                 while let Some(child) = content_box.first_child() {
                                     content_box.remove(&child);
                                 }
-
-                                build_content(&content_box, &data, &nav_stack, &window);
+                                build_content(&content_box, &data, &nav_stack, &window, &state);
                                 *data_store.lock().unwrap() = Some(data);
                                 page_stack.set_visible_child_name("content");
                             }
@@ -167,19 +174,16 @@ pub fn build(
                 }
             ));
 
-            let has_manager = state.manager.lock().unwrap().is_some();
-            if has_manager {
-                let client = {
-                    let lock = state.manager.lock().unwrap();
-                    lock.as_ref().map(|m| m.client.clone())
-                };
-                if let Some(client) = client {
-                    runtime::spawn(fetch_home_data(client), tx);
-                } else {
-                    let _ = tx.send_blocking(HomeLoad::Error("Not connected".to_string()));
+            let client = {
+                let lock = state.manager.lock().unwrap();
+                lock.as_ref().map(|m| m.client.clone())
+            };
+
+            match client {
+                Some(c) => runtime::spawn(fetch_home_data(c), tx),
+                None => {
+                    let _ = tx.send_blocking(HomeLoad::Error("Not connected to any server.".to_string()));
                 }
-            } else {
-                let _ = tx.send_blocking(HomeLoad::Error("Not connected".to_string()));
             }
         }
     };
@@ -193,11 +197,7 @@ pub fn build(
     toolbar_view
 }
 
-async fn fetch_home_data(client: std::sync::Arc<api::client::TrueNasClient>) -> HomeLoad {
-    use api::models::system::{SystemInfo, Pool, DiskDetails};
-    use api::models::shares::{SmbShare, NfsShare};
-    use api::methods::{System as SystemMethods, Shares as ShareMethods};
-
+async fn fetch_home_data(client: std::sync::Arc<TrueNasClient>) -> HomeLoad {
     let system_info = match client.call::<SystemInfo>(SystemMethods::INFO, vec![]).await {
         ApiResult::Success(info) => info,
         ApiResult::Error { message } => return HomeLoad::Error(message),
@@ -227,122 +227,156 @@ async fn fetch_home_data(client: std::sync::Arc<api::client::TrueNasClient>) -> 
     HomeLoad::Success(HomeData { system_info, pools, disks, smb_shares, nfs_shares })
 }
 
-fn build_content(container: &GBox, data: &HomeData, nav_stack: &Stack, window: &ApplicationWindow) {
-    container.append(&system_overview_card(data));
-    container.append(&make_spacer(12));
-    container.append(&metrics_group(data));
-    container.append(&make_spacer(12));
-    container.append(&storage_stats_group(data, nav_stack, window));
-    container.append(&make_spacer(12));
-    container.append(&storage_group(data, nav_stack, window));
-    container.append(&make_spacer(12));
-    container.append(&shares_group(data, nav_stack, window));
+fn build_content(
+    container: &GBox,
+    data: &HomeData,
+    nav_stack: &Stack,
+    window: &ApplicationWindow,
+    state: &AppState,
+) {
+    let state_clone = state.clone();
+    container.append(&server_identity_group(data));
+    container.append(&spacer(12));
+    container.append(&hardware_group(data));
+    container.append(&spacer(12));
+    container.append(&performance_group(nav_stack, state));
+    container.append(&spacer(12));
+    container.append(&storage_pools_group(data, nav_stack,&state_clone));
+    container.append(&spacer(12));
+    container.append(&disks_group(data, nav_stack));
+    container.append(&spacer(12));
+    container.append(&shares_group(data, nav_stack));
 }
 
-fn system_overview_card(data: &HomeData) -> PreferencesGroup {
+fn server_identity_group(data: &HomeData) -> PreferencesGroup {
     let group = PreferencesGroup::new();
 
-    let row = ActionRow::builder()
+    let host_row = ActionRow::builder()
         .title(&data.system_info.hostname)
         .subtitle(&data.system_info.version)
         .build();
-    row.set_icon_name(Some("computer-symbolic"));
+    host_row.set_icon_name(Some("network-server-symbolic"));
 
-    let badge = gtk4::Label::builder()
-        .label("Online")
-        .css_classes(vec!["success", "caption"])
-        .valign(Align::Center)
-        .build();
-    row.add_suffix(&badge);
+    let online_badge = pill_label("Online", &["success", "caption"]);
+    host_row.add_suffix(&online_badge);
+    group.add(&host_row);
 
     let uptime_row = ActionRow::builder()
         .title("Uptime")
         .subtitle(&data.system_info.uptime)
         .build();
     uptime_row.set_icon_name(Some("preferences-system-time-symbolic"));
-
-    let model_row = ActionRow::builder()
-        .title("Model")
-        .subtitle(&data.system_info.model)
-        .build();
-    model_row.set_icon_name(Some("computer-symbolic"));
-
-    group.add(&row);
     group.add(&uptime_row);
-    group.add(&model_row);
+
+    if let Some(product) = &data.system_info.system_product {
+        if !product.is_empty() {
+            let model_row = ActionRow::builder()
+                .title("Hardware")
+                .subtitle(product)
+                .build();
+            model_row.set_icon_name(Some("computer-symbolic"));
+            group.add(&model_row);
+        }
+    }
+
+    let tz_row = ActionRow::builder()
+        .title("Timezone")
+        .subtitle(&data.system_info.timezone)
+        .build();
+    tz_row.set_icon_name(Some("globe-symbolic"));
+    group.add(&tz_row);
+
     group
 }
-
-fn metrics_group(data: &HomeData) -> PreferencesGroup {
+fn performance_group(nav_stack: &Stack, state: &AppState) -> PreferencesGroup {
     let group = PreferencesGroup::new();
-    group.set_title("System");
-    group.set_description(Some("Hardware resources"));
 
-    let cores = data.system_info.cores as i32;
-    let physical = data.system_info.physical_cores.unwrap_or(cores);
+    let row = ActionRow::builder()
+        .title("Performance Monitor")
+        .subtitle("CPU, Memory, Temperature")
+        .activatable(true)
+        .build();
+    row.set_icon_name(Some("utilities-system-monitor-symbolic"));
+    row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+
+    let nav = nav_stack.clone();
+    let state = state.clone();
+    row.connect_activated(move |_| {
+        if let Some(old) = nav.child_by_name("performance") {
+            nav.remove(&old);
+        }
+        let page = performance::build(state.clone(), MetricType::Cpu, nav.clone());
+        nav.add_named(&page, Some("performance"));
+        nav.set_transition_type(StackTransitionType::SlideLeft);
+        nav.set_visible_child_name("performance");
+    });
+
+    group.add(&row);
+    group
+}
+fn hardware_group(data: &HomeData) -> PreferencesGroup {
+    let group = PreferencesGroup::new();
+    group.set_title("Hardware");
+
+    let cores_total = data.system_info.cores as i32;
+    let cores_phys = data.system_info.physical_cores.unwrap_or(cores_total);
+
     let cpu_row = ActionRow::builder()
-        .title("CPU Cores")
-        .subtitle(&format!("{cores} logical  /  {physical} physical"))
+        .title("CPU")
+        .subtitle(&format!("{cores_total} threads  /  {cores_phys} cores"))
         .build();
     cpu_row.set_icon_name(Some("processor-symbolic"));
+
+    let core_label = right_label(&format!("{cores_phys}C / {cores_total}T"), &["caption", "dim-label"]);
+    cpu_row.add_suffix(&core_label);
     group.add(&cpu_row);
 
-    let mem_gb = data.system_info.physmem
-        .map(|m| m as f64 / (1024.0 * 1024.0 * 1024.0))
-        .unwrap_or(0.0);
-    let ecc = if data.system_info.ecc_memory { " (ECC)" } else { "" };
-    let mem_row = ActionRow::builder()
-        .title("Memory")
-        .subtitle(&format!("{:.1} GB{ecc}", mem_gb))
-        .build();
-    mem_row.set_icon_name(Some("memory-chip-symbolic"));
-    group.add(&mem_row);
+    if let Some(mem_bytes) = data.system_info.physmem {
+        let mem_gb = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let ecc_tag = if data.system_info.ecc_memory { "ECC" } else { "Non-ECC" };
+
+        let mem_row = ActionRow::builder()
+            .title("Memory")
+            .subtitle(&format!("{:.1} GB  ·  {}", mem_gb, ecc_tag))
+            .build();
+        mem_row.set_icon_name(Some("memory-chip-symbolic"));
+
+        let ecc_badge = if data.system_info.ecc_memory {
+            pill_label("ECC", &["success", "caption"])
+        } else {
+            pill_label("Non-ECC", &["caption", "dim-label"])
+        };
+        mem_row.add_suffix(&ecc_badge);
+        group.add(&mem_row);
+    }
 
     if data.system_info.loadavg.len() >= 3 {
         let la = &data.system_info.loadavg;
         let load_row = ActionRow::builder()
             .title("Load Average")
-            .subtitle(&format!("{:.2}  {:.2}  {:.2}  (1m / 5m / 15m)", la[0], la[1], la[2]))
+            .subtitle("1 min  /  5 min  /  15 min")
             .build();
         load_row.set_icon_name(Some("speedometer-symbolic"));
+
+        let load_label = right_label(
+            &format!("{:.2}  {:.2}  {:.2}", la[0], la[1], la[2]),
+            &["caption"],
+        );
+        load_row.add_suffix(&load_label);
         group.add(&load_row);
     }
 
     group
 }
 
-fn storage_stats_group(data: &HomeData, nav_stack: &Stack, window: &ApplicationWindow) -> PreferencesGroup {
-    let group = PreferencesGroup::new();
-    group.set_title("Storage Overview");
-
-    let disk_count = data.disks.len();
-    let disk_row = ActionRow::builder()
-        .title("Disks")
-        .subtitle(&format!("{disk_count} disk(s) detected"))
-        .activatable(true)
-        .build();
-    disk_row.set_icon_name(Some("drive-harddisk-symbolic"));
-    let arrow = gtk4::Image::from_icon_name("go-next-symbolic");
-    disk_row.add_suffix(&arrow);
-
-    let nav = nav_stack.clone();
-    disk_row.connect_activated(move |_| {
-        ensure_stub_page(&nav, "disks", "Drive Info", "drive-harddisk-symbolic",
-                         "Disk details coming soon");
-        nav.set_visible_child_name("disks");
-    });
-
-    group.add(&disk_row);
-    group
-}
-
-fn storage_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow) -> PreferencesGroup {
+fn storage_pools_group(data: &HomeData, nav_stack: &Stack, state: &AppState) -> PreferencesGroup{
     let group = PreferencesGroup::new();
     group.set_title("Storage Pools");
+    group.set_description(Some(&format!("{} pool(s) configured", data.pools.len())));
 
     if data.pools.is_empty() {
         let empty = ActionRow::builder()
-            .title("No pools configured")
+            .title("No storage pools configured")
             .build();
         empty.set_icon_name(Some("drive-harddisk-symbolic"));
         group.add(&empty);
@@ -351,84 +385,100 @@ fn storage_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow
 
     for pool in &data.pools {
         let used_pct = if pool.size > 0 {
-            (pool.allocated as f64 / pool.size as f64 * 100.0) as i32
-        } else { 0 };
+            pool.allocated as f64 / pool.size as f64
+        } else {
+            0.0
+        };
+        let used_pct_int = (used_pct * 100.0) as i32;
 
-        let status_icon = if pool.healthy { "emblem-ok-symbolic" } else { "dialog-error-symbolic" };
+        let health_icon = match (pool.healthy, pool.warning) {
+            (true, false) => "emblem-ok-symbolic",
+            (true, true) => "dialog-warning-symbolic",
+            (false, _) => "dialog-error-symbolic",
+        };
+
+        let health_text = match (pool.healthy, pool.warning) {
+            (true, false) => "Healthy",
+            (true, true) => "Warning",
+            (false, _) => "Degraded",
+        };
 
         let expander = ExpanderRow::builder()
             .title(&pool.name)
-            .subtitle(&format!(
-                "{}  •  {}% used",
-                if pool.healthy { "Healthy" } else { "Degraded" },
-                used_pct
-            ))
+            .subtitle(&format!("{health_text}  ·  {used_pct_int}% used  ·  {}", pool.status_code))
             .build();
-        expander.set_icon_name(Some(status_icon));
+        expander.set_icon_name(Some(health_icon));
 
-        let bar_box = GBox::builder()
-            .orientation(Orientation::Vertical)
-            .margin_top(4)
-            .margin_bottom(8)
-            .margin_start(12)
-            .margin_end(12)
-            .spacing(4)
-            .build();
+        let health_badge_class = match (pool.healthy, pool.warning) {
+            (true, false) => "success",
+            (true, true) => "warning",
+            (false, _) => "error",
+        };
+        let badge = pill_label(health_text, &[health_badge_class, "caption"]);
+        expander.add_suffix(&badge);
 
-        let bar = gtk4::LevelBar::new();
-        bar.set_min_value(0.0);
-        bar.set_max_value(100.0);
-        bar.set_value(used_pct as f64);
-        bar.set_mode(gtk4::LevelBarMode::Continuous);
-
-        let bar_label = gtk4::Label::builder()
-            .label(&format!(
-                "Used: {}  •  Free: {}  •  Total: {}",
-                format_bytes(pool.allocated),
-                format_bytes(pool.free),
-                format_bytes(pool.size)
-            ))
-            .css_classes(vec!["caption", "dim-label"])
-            .halign(Align::Start)
-            .build();
-
-        bar_box.append(&bar);
-        bar_box.append(&bar_label);
-
-        let bar_row = libadwaita::PreferencesRow::new();
-        bar_row.set_child(Some(&bar_box));
+        let bar_row = storage_bar_row(pool.allocated, pool.free, pool.size, used_pct);
         expander.add_row(&bar_row);
+
+        let alloc_row = ActionRow::builder()
+            .title("Allocated")
+            .build();
+        alloc_row.add_suffix(&right_label(&format_bytes(pool.allocated), &["caption"]));
+        expander.add_row(&alloc_row);
+
+        let free_row = ActionRow::builder()
+            .title("Free")
+            .build();
+        free_row.add_suffix(&right_label(&format_bytes(pool.free), &["caption", "success"]));
+        expander.add_row(&free_row);
+
+        let total_row = ActionRow::builder()
+            .title("Total")
+            .build();
+        total_row.add_suffix(&right_label(&format_bytes(pool.size), &["caption"]));
+        expander.add_row(&total_row);
+
+        let frag_row = ActionRow::builder()
+            .title("Fragmentation")
+            .build();
+        frag_row.add_suffix(&right_label(&format!("{}%", pool.fragmentation), &["caption"]));
+        expander.add_row(&frag_row);
+
+        let trim_row = ActionRow::builder()
+            .title("Auto Trim")
+            .build();
+        trim_row.add_suffix(&right_label(&pool.autotrim.parsed, &["caption"]));
+        expander.add_row(&trim_row);
 
         if let Some(detail) = &pool.status_detail {
             if !detail.is_empty() {
                 let detail_row = ActionRow::builder()
-                    .title("Status")
+                    .title("Status Detail")
                     .subtitle(detail)
                     .build();
                 expander.add_row(&detail_row);
             }
         }
 
-        let frag_row = ActionRow::builder()
-            .title("Fragmentation")
-            .subtitle(&format!("{}%", pool.fragmentation))
-            .build();
-        expander.add_row(&frag_row);
-
-        let details_row = ActionRow::builder()
+        let details_btn = ActionRow::builder()
             .title("View Pool Details")
             .activatable(true)
             .build();
-        details_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+        details_btn.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+        details_btn.set_icon_name(Some("drive-harddisk-symbolic"));
 
         let nav = nav_stack.clone();
-        let pool_name = pool.name.clone();
-        details_row.connect_activated(move |_| {
-            ensure_stub_page(&nav, "pool-details", "Pool Details", "drive-harddisk-symbolic",
-                             &format!("Pool details for '{}' coming soon", pool_name));
+        let pool_clone = pool.clone();
+        let state_clone = state.clone();
+        details_btn.connect_activated(move |_| {
+            let page = pool_details::build(state_clone.clone(), pool_clone.clone(), nav.clone());
+            if nav.child_by_name("pool-details").is_none() {
+                nav.add_named(&page, Some("pool-details"));
+            }
+            nav.set_transition_type(StackTransitionType::SlideLeft);
             nav.set_visible_child_name("pool-details");
         });
-        expander.add_row(&details_row);
+        expander.add_row(&details_btn);
 
         group.add(&expander);
     }
@@ -436,19 +486,128 @@ fn storage_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow
     group
 }
 
-fn shares_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow) -> PreferencesGroup {
+fn storage_bar_row(allocated: i64, free: i64, total: i64, used_fraction: f64) -> libadwaita::PreferencesRow {
+    let wrapper = GBox::builder()
+        .orientation(Orientation::Vertical)
+        .margin_top(8)
+        .margin_bottom(10)
+        .margin_start(16)
+        .margin_end(16)
+        .spacing(6)
+        .build();
+
+    let bar = gtk4::LevelBar::new();
+    bar.set_min_value(0.0);
+    bar.set_max_value(1.0);
+    bar.set_value(used_fraction.clamp(0.0, 1.0));
+    bar.set_mode(gtk4::LevelBarMode::Continuous);
+    bar.add_css_class("storage-bar");
+
+    let stats_row = GBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(0)
+        .build();
+
+    let used_lbl = gtk4::Label::builder()
+        .label(&format!("Used: {}", format_bytes(allocated)))
+        .css_classes(vec!["caption", "dim-label"])
+        .halign(Align::Start)
+        .hexpand(true)
+        .build();
+
+    let free_lbl = gtk4::Label::builder()
+        .label(&format!("Free: {}", format_bytes(free)))
+        .css_classes(vec!["caption", "success"])
+        .halign(Align::End)
+        .build();
+
+    stats_row.append(&used_lbl);
+    stats_row.append(&free_lbl);
+
+    wrapper.append(&bar);
+    wrapper.append(&stats_row);
+
+    let row = libadwaita::PreferencesRow::new();
+    row.set_child(Some(&wrapper));
+    row
+}
+
+fn disks_group(data: &HomeData, nav_stack: &Stack) -> PreferencesGroup {
     let group = PreferencesGroup::new();
-    group.set_title("Shares");
+    group.set_title("Disks");
+    group.set_description(Some(&format!("{} disk(s) detected", data.disks.len())));
+
+    if data.disks.is_empty() {
+        let empty = ActionRow::builder().title("No disks found").build();
+        empty.set_icon_name(Some("drive-harddisk-symbolic"));
+        group.add(&empty);
+        return group;
+    }
+
+    let expander = ExpanderRow::builder()
+        .title("All Disks")
+        .subtitle(&format!("{} disk(s)", data.disks.len()))
+        .build();
+    expander.set_icon_name(Some("drive-harddisk-symbolic"));
+
+    let count_badge = pill_label(&data.disks.len().to_string(), &["caption"]);
+    expander.add_suffix(&count_badge);
+
+    for disk in &data.disks {
+        let size_str = format_bytes(disk.size);
+        let model = disk.model.as_deref().unwrap_or("Unknown");
+        let pool_hint = disk.pool.as_deref().unwrap_or("—");
+
+        let row = ActionRow::builder()
+            .title(&disk.name)
+            .subtitle(&format!("{model}  ·  Pool: {pool_hint}"))
+            .activatable(true)
+            .build();
+        row.set_icon_name(Some("drive-harddisk-symbolic"));
+
+        let type_badge = pill_label(&disk.disk_type, &["caption", "dim-label"]);
+        row.add_suffix(&type_badge);
+
+        let size_badge = pill_label(&size_str, &["caption"]);
+        row.add_suffix(&size_badge);
+        row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+
+        let nav = nav_stack.clone();
+        let dname = disk.name.clone();
+        let disk_data = data.disks.clone();
+
+        row.connect_activated(move |_| {
+            let page = disk_info::build(disk_data.clone(), nav.clone());
+            if nav.child_by_name("disk-info").is_none() {
+                nav.add_named(&page, Some("disk-info"));
+            }
+            nav.set_visible_child_name("disk-info");
+        });
+
+        expander.add_row(&row);
+    }
+
+    group.add(&expander);
+    group
+}
+
+fn shares_group(data: &HomeData, nav_stack: &Stack) -> PreferencesGroup {
+    let group = PreferencesGroup::new();
+    group.set_title("Network Shares");
+    group.set_description(Some(&format!(
+        "{} SMB  ·  {} NFS",
+        data.smb_shares.len(), data.nfs_shares.len()
+    )));
 
     let smb_expander = ExpanderRow::builder()
         .title("SMB Shares")
         .subtitle(&format!("{} share(s)", data.smb_shares.len()))
         .build();
     smb_expander.set_icon_name(Some("folder-remote-symbolic"));
+    smb_expander.add_suffix(&pill_label(&data.smb_shares.len().to_string(), &["caption"]));
 
     if data.smb_shares.is_empty() {
-        let none = ActionRow::builder().title("No SMB shares").build();
-        smb_expander.add_row(&none);
+        smb_expander.add_row(&empty_row("No SMB shares configured"));
     } else {
         for share in &data.smb_shares {
             let row = ActionRow::builder()
@@ -456,24 +615,26 @@ fn shares_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow)
                 .subtitle(&share.path)
                 .activatable(true)
                 .build();
-            let status = gtk4::Label::builder()
-                .label(if share.enabled { "Active" } else { "Off" })
-                .css_classes(vec![
-                    "caption",
-                    if share.enabled { "success" } else { "error" }
-                ])
-                .valign(Align::Center)
-                .build();
-            row.add_suffix(&status);
-            row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
             row.set_icon_name(Some("folder-symbolic"));
 
+            let (label_text, label_classes): (&str, &[&str]) = if share.enabled {
+                ("Active", &["caption", "success"])
+            } else {
+                ("Off", &["caption", "error"])
+            };
+            row.add_suffix(&pill_label(label_text, label_classes));
+            row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+
             let nav = nav_stack.clone();
-            let share_name = share.name.clone();
+
+            let sname = share.name.clone();
+            let share_clone = share.clone();
             row.connect_activated(move |_| {
-                ensure_stub_page(&nav, "share-info", "Share Info", "folder-remote-symbolic",
-                                 &format!("Share details for '{}' coming soon", share_name));
-                nav.set_visible_child_name("share-info");
+                let page = share_info::build(ShareType::Smb(share_clone.clone()), nav.clone());
+                if nav.child_by_name("share-smb").is_none() {
+                    nav.add_named(&page, Some("share-smb"));
+                }
+                nav.set_visible_child_name("share-smb");
             });
             smb_expander.add_row(&row);
         }
@@ -485,36 +646,36 @@ fn shares_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow)
         .subtitle(&format!("{} share(s)", data.nfs_shares.len()))
         .build();
     nfs_expander.set_icon_name(Some("folder-remote-symbolic"));
+    nfs_expander.add_suffix(&pill_label(&data.nfs_shares.len().to_string(), &["caption"]));
 
     if data.nfs_shares.is_empty() {
-        let none = ActionRow::builder().title("No NFS shares").build();
-        nfs_expander.add_row(&none);
+        nfs_expander.add_row(&empty_row("No NFS shares configured"));
     } else {
         for share in &data.nfs_shares {
-            let name = share.path.split('/').last().unwrap_or(&share.path).to_string();
+            let display = share.path.split('/').last().unwrap_or(&share.path).to_string();
             let row = ActionRow::builder()
-                .title(&name)
+                .title(&display)
                 .subtitle(&share.path)
                 .activatable(true)
                 .build();
-            let status = gtk4::Label::builder()
-                .label(if share.enabled { "Active" } else { "Off" })
-                .css_classes(vec![
-                    "caption",
-                    if share.enabled { "success" } else { "error" }
-                ])
-                .valign(Align::Center)
-                .build();
-            row.add_suffix(&status);
-            row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
             row.set_icon_name(Some("folder-symbolic"));
 
+            let (label_text, label_classes): (&str, &[&str]) = if share.enabled {
+                ("Active", &["caption", "success"])
+            } else {
+                ("Off", &["caption", "error"])
+            };
+            row.add_suffix(&pill_label(label_text, label_classes));
+            row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+
             let nav = nav_stack.clone();
-            let share_path = share.path.clone();
+            let share_clone = share.clone();
             row.connect_activated(move |_| {
-                ensure_stub_page(&nav, "share-info", "Share Info", "folder-remote-symbolic",
-                                 &format!("NFS share details for '{}' coming soon", share_path));
-                nav.set_visible_child_name("share-info");
+                let page = share_info::build(ShareType::Nfs(share_clone.clone()), nav.clone());
+                if nav.child_by_name("share-nfs").is_none() {
+                    nav.add_named(&page, Some("share-nfs"));
+                }
+                nav.set_visible_child_name("share-nfs");
             });
             nfs_expander.add_row(&row);
         }
@@ -524,45 +685,75 @@ fn shares_group(data: &HomeData, nav_stack: &Stack, _window: &ApplicationWindow)
     group
 }
 
-fn ensure_stub_page(nav_stack: &Stack, name: &str, title: &str, icon: &str, description: &str) {
-    if nav_stack.child_by_name(name).is_some() {
-        return;
+fn pill_label(text: &str, css_classes: &[&str]) -> gtk4::Label {
+    let label = gtk4::Label::builder()
+        .label(text)
+        .valign(Align::Center)
+        .build();
+    for cls in css_classes {
+        label.add_css_class(cls);
     }
-
-    let stub_toolbar = ToolbarView::new();
-
-    let header = HeaderBar::new();
-    let title_label = gtk4::Label::builder()
-        .label(title)
-        .css_classes(vec!["title"])
-        .build();
-    header.set_title_widget(Some(&title_label));
-
-    let back_btn = gtk4::Button::builder()
-        .icon_name("go-previous-symbolic")
-        .tooltip_text("Back")
-        .build();
-    header.pack_start(&back_btn);
-    stub_toolbar.add_top_bar(&header);
-
-    let status = StatusPage::builder()
-        .icon_name(icon)
-        .title(title)
-        .description(description)
-        .build();
-
-    stub_toolbar.set_content(Some(&status));
-
-    let nav = nav_stack.clone();
-    back_btn.connect_clicked(move |_| {
-        nav.set_visible_child_name("home");
-    });
-
-    nav_stack.add_named(&stub_toolbar, Some(name));
-    nav_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+    label
 }
 
-fn make_spacer(height: i32) -> gtk4::Box {
+fn right_label(text: &str, css_classes: &[&str]) -> gtk4::Label {
+    let label = gtk4::Label::builder()
+        .label(text)
+        .valign(Align::Center)
+        .halign(Align::End)
+        .build();
+    for cls in css_classes {
+        label.add_css_class(cls);
+    }
+    label
+}
+
+fn empty_row(text: &str) -> ActionRow {
+    let row = ActionRow::builder()
+        .title(text)
+        .build();
+    row.set_sensitive(false);
+    row
+}
+
+fn push_stub_page(nav_stack: &Stack, name: &str, title: &str, icon: &str, description: &str) {
+    if nav_stack.child_by_name(name).is_none() {
+        let stub_toolbar = ToolbarView::new();
+
+        let header = HeaderBar::new();
+        let title_label = gtk4::Label::builder()
+            .label(title)
+            .css_classes(vec!["title"])
+            .build();
+        header.set_title_widget(Some(&title_label));
+
+        let back_btn = gtk4::Button::builder()
+            .icon_name("go-previous-symbolic")
+            .tooltip_text("Back")
+            .build();
+        header.pack_start(&back_btn);
+        stub_toolbar.add_top_bar(&header);
+
+        let status = StatusPage::builder()
+            .icon_name(icon)
+            .title(title)
+            .description(description)
+            .build();
+        stub_toolbar.set_content(Some(&status));
+
+        let nav = nav_stack.clone();
+        back_btn.connect_clicked(move |_| {
+            nav.set_visible_child_name("home");
+        });
+
+        nav_stack.add_named(&stub_toolbar, Some(name));
+    }
+
+    nav_stack.set_transition_type(StackTransitionType::SlideLeft);
+    nav_stack.set_visible_child_name(name);
+}
+
+fn spacer(height: i32) -> gtk4::Box {
     let b = gtk4::Box::new(Orientation::Vertical, 0);
     b.set_height_request(height);
     b

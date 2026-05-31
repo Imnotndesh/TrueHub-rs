@@ -7,4 +7,4 @@ pub(crate) mod user;
 mod apps;
 pub(crate) mod virt;
 pub(crate) mod vm;
-pub(crate) mod storage;
+pub mod storage;
